@@ -1,257 +1,247 @@
 """
-Portfolio Monitor — Automation post-clôture US
-Exécute le workflow portfolio-monitor via l'API Anthropic et envoie l'email.
+Portfolio Monitor — Automation post-cloture US.
 
-Dépendances : pip install anthropic yfinance schedule python-dotenv
-Configuration : fichier .env dans le même dossier (voir README)
+Le calcul quantitatif (cours, variations, poids, performance ponderee,
+comparaison au S&P 500, detection des mouvements > 1 %) est fait en Python
+de maniere deterministe via yfinance. L'API Anthropic n'intervient ensuite
+que pour le commentaire qualitatif des mouvements (recherche de catalyseur,
+contexte news), a partir des chiffres deja calcules.
+
+Dependances : pip install -r requirements.txt
+Configuration : fichier .env dans le meme dossier (voir README).
 """
 
 import os
+import sys
 import smtplib
 import logging
-import schedule
-import time
 from datetime import datetime, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from zoneinfo import ZoneInfo
 
+import yfinance as yf
 import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# -- Logging -----------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("portfolio_monitor.log"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.FileHandler("portfolio_monitor.log"), logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
-# ── Config depuis .env ─────────────────────────────────────────────────────────
+# -- Config depuis .env ------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-EMAIL_SENDER      = os.getenv("EMAIL_SENDER")       # ex: moncompte@gmail.com
-EMAIL_PASSWORD    = os.getenv("EMAIL_PASSWORD")      # mot de passe app Gmail
-EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT")     # ex: nicolas@email.com
+EMAIL_SENDER      = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD    = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT")
 SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
 
-# ── Portefeuille ───────────────────────────────────────────────────────────────
-PORTFOLIO = """
-| Ticker | Nom                   | Nombre | Bourse       | Secteur                    |
-|--------|-----------------------|--------|--------------|----------------------------|
-| AAPL   | Apple Inc.            | 5,01   | NASDAQ (USD) | Technology                 |
-| UNH    | UnitedHealth Group    | 1,43   | NYSE (USD)   | Healthcare                 |
-| V      | Visa Inc.             | 3,38   | NYSE (USD)   | Financial Services         |
-| PG     | Procter & Gamble      | 2,97   | NYSE (USD)   | Consumer Staples           |
-| AVGO   | Broadcom Inc.         | 5,9    | NASDAQ (USD) | Semiconductors             |
-| KO     | Coca-Cola             | 7,7    | NYSE (USD)   | Consumer Staples           |
-| MSFT   | Microsoft             | 3,45   | NASDAQ (USD) | Technology                 |
-| BLK    | BlackRock             | 0,35   | NYSE (USD)   | Financial Services         |
-| DLR    | Digital Realty Trust  | 5,45   | NYSE (USD)   | REIT                       |
-| HD     | Home Depot            | 0,78   | NYSE (USD)   | Retail                     |
-| MC     | LVMH                  | 5      | Euronext (€) | Luxury                     |
-| TTE    | TotalEnergies         | 35     | Euronext (€) | Oil & Gas                  |
-| AXA    | AXA SA                | 20     | Euronext (€) | Insurance                  |
-| ENX    | Euronext NV           | 5      | Euronext (€) | Financial Services         |
-| SU     | Schneider Electric    | 4      | Euronext (€) | Industrials                |
-| NVO    | Novo Nordisk          | 9      | NYSE (USD)   | Pharmaceuticals            |
-| AI     | Air Liquide           | 10     | Euronext (€) | Chemicals                  |
-"""
+MOVER_THRESHOLD = 0.01  # +/-1 %
+BENCHMARK       = "^GSPC"
 
-# ── Prompt système ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Tu es un assistant d'analyse de portefeuille boursier. Tu appliques rigoureusement le workflow suivant à chaque exécution.
+# -- Portefeuille ------------------------------------------------------------
+# symbol = symbole Yahoo Finance (suffixe .PA pour Euronext Paris)
+# ccy    = devise de cotation
+PORTFOLIO = [
+    {"symbol": "AAPL",  "name": "Apple",             "shares": 5.01, "ccy": "USD"},
+    {"symbol": "UNH",   "name": "UnitedHealth",      "shares": 1.43, "ccy": "USD"},
+    {"symbol": "V",     "name": "Visa",              "shares": 3.38, "ccy": "USD"},
+    {"symbol": "PG",    "name": "Procter & Gamble",  "shares": 2.97, "ccy": "USD"},
+    {"symbol": "AVGO",  "name": "Broadcom",          "shares": 5.90, "ccy": "USD"},
+    {"symbol": "KO",    "name": "Coca-Cola",         "shares": 7.70, "ccy": "USD"},
+    {"symbol": "MSFT",  "name": "Microsoft",         "shares": 3.45, "ccy": "USD"},
+    {"symbol": "BLK",   "name": "BlackRock",         "shares": 0.35, "ccy": "USD"},
+    {"symbol": "DLR",   "name": "Digital Realty",    "shares": 5.45, "ccy": "USD"},
+    {"symbol": "HD",    "name": "Home Depot",        "shares": 0.78, "ccy": "USD"},
+    {"symbol": "NVO",   "name": "Novo Nordisk",      "shares": 9.00, "ccy": "USD"},
+    {"symbol": "MC.PA", "name": "LVMH",              "shares": 5.00, "ccy": "EUR"},
+    {"symbol": "TTE.PA","name": "TotalEnergies",     "shares": 35.0, "ccy": "EUR"},
+    {"symbol": "CS.PA", "name": "AXA",               "shares": 20.0, "ccy": "EUR"},
+    {"symbol": "ENX.PA","name": "Euronext",          "shares": 5.00, "ccy": "EUR"},
+    {"symbol": "SU.PA", "name": "Schneider Electric","shares": 4.00, "ccy": "EUR"},
+    {"symbol": "AI.PA", "name": "Air Liquide",       "shares": 10.0, "ccy": "EUR"},
+]
 
-## Portefeuille à analyser
 
-{portfolio}
+def fetch_eurusd() -> float:
+    """Taux EUR/USD pour convertir les positions USD en base EUR."""
+    data = yf.Ticker("EURUSD=X").history(period="5d")
+    if data.empty:
+        raise ValueError("Taux EUR/USD indisponible.")
+    return float(data["Close"].iloc[-1])
 
-## Workflow obligatoire
 
-### Étape 1 — Données de marché
-Pour chaque position :
-- Récupère le cours de clôture du jour et le cours de clôture précédent via web search
-- Calcule la variation : ((clôture - clôture_préc) / clôture_préc) × 100
-- Calcule la performance pondérée du portfolio par valeur de marché (prix × quantité)
-- Les positions européennes (MC, TTE, AXA, ENX, SU, AI) sont en EUR sur Euronext Paris
+def compute_metrics() -> dict:
+    """Calcule, en Python, toute la couche quantitative du rapport.
 
-### Étape 2 — Identification des mouvements > ±1%
-Pour chaque position avec |variation| > 1%, recherche les informations récentes (24–72h) dans cet ordre de priorité :
-1. Résultats financiers (EPS, CA vs consensus, guidance)
-2. Actions d'analystes (upgrade, downgrade, révision de cible)
-3. Actualité produit/business (lancements, contrats, partenariats, régulation)
-4. Événements macro (Fed, CPI, emploi, taux)
-5. Rotation sectorielle
-6. Actualité réglementaire ou judiciaire
-7. Sentiment / positionnement (short squeeze, flux retail confirmés)
-8. Réajustement de valorisation
+    Retourne un dict avec : les lignes par position (variation, valeur de marche
+    en EUR, poids), la performance ponderee du portefeuille, la variation du
+    benchmark, et la liste des mouvements > seuil. Aucune de ces valeurs ne
+    depend du LLM.
+    """
+    eurusd = fetch_eurusd()
+    log.info(f"EUR/USD = {eurusd:.4f}")
 
-Si aucun catalyseur solide n'est identifié : écrire "Aucun catalyseur clair identifié."
-Ne jamais inventer une cause. Si incertain, le dire explicitement.
-Si plusieurs causes existent, les classer par probabilité décroissante.
+    rows, total_mv_eur = [], 0.0
+    for pos in PORTFOLIO:
+        hist = yf.Ticker(pos["symbol"]).history(period="5d")
+        if len(hist) < 2:
+            log.warning(f"Donnees insuffisantes pour {pos['symbol']} — ignore.")
+            continue
+        prev_close = float(hist["Close"].iloc[-2])
+        last_close = float(hist["Close"].iloc[-1])
+        change_pct = (last_close - prev_close) / prev_close
 
-### Étape 3 — Classification
-Pour chaque mouvement > ±1%, classer le moteur principal :
-- Fondamentaux — résultats, guidance, révision analyste, news produit
-- Macro — taux, inflation, géopolitique, devise
-- Sentiment — positionnement, short squeeze, flux retail
-- Aucun catalyseur clair
+        mv_local = last_close * pos["shares"]
+        mv_eur   = mv_local if pos["ccy"] == "EUR" else mv_local / eurusd
+        total_mv_eur += mv_eur
 
-### Étape 4 — Rédaction de l'email
+        rows.append({
+            "symbol": pos["symbol"], "name": pos["name"], "ccy": pos["ccy"],
+            "last": last_close, "change_pct": change_pct, "mv_eur": mv_eur,
+        })
 
-Produire l'email EN FRANÇAIS avec cette structure exacte :
+    for r in rows:
+        r["weight"] = r["mv_eur"] / total_mv_eur if total_mv_eur else 0.0
 
----
-Objet : Performance quotidienne du portfolio – {date}
+    # Performance ponderee = somme(poids * variation locale).
+    # Note : variation en devise locale ; l'effet de change n'est pas inclus.
+    weighted_return = sum(r["weight"] * r["change_pct"] for r in rows)
+
+    bench = yf.Ticker(BENCHMARK).history(period="5d")
+    bench_return = (
+        (float(bench["Close"].iloc[-1]) - float(bench["Close"].iloc[-2]))
+        / float(bench["Close"].iloc[-2])
+    ) if len(bench) >= 2 else None
+
+    rows.sort(key=lambda r: abs(r["change_pct"]), reverse=True)
+    movers = [r for r in rows if abs(r["change_pct"]) > MOVER_THRESHOLD]
+
+    return {
+        "rows": rows, "movers": movers, "total_mv_eur": total_mv_eur,
+        "weighted_return": weighted_return, "bench_return": bench_return,
+        "eurusd": eurusd,
+    }
+
+
+def format_facts(m: dict, today_str: str) -> str:
+    """Bloc de faits chiffres passe au LLM. Le LLM ne recalcule rien."""
+    def pct(x): return f"{x * 100:+.2f} %" if x is not None else "n/d"
+
+    lines = [
+        f"Date : {today_str}",
+        f"Performance ponderee du portefeuille (jour) : {pct(m['weighted_return'])}",
+        f"Variation S&P 500 (jour) : {pct(m['bench_return'])}",
+        f"Valeur de marche totale : {m['total_mv_eur']:,.0f} EUR",
+        "",
+        "Toutes les positions (triees par |variation|) :",
+        "| Ticker | Nom | Variation | Poids |",
+        "|---|---|---|---|",
+    ]
+    for r in m["rows"]:
+        lines.append(f"| {r['symbol']} | {r['name']} | {pct(r['change_pct'])} | {r['weight'] * 100:.1f} % |")
+
+    lines += ["", f"Mouvements > +/-1 % a expliquer : {', '.join(r['symbol'] for r in m['movers']) or 'aucun'}"]
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = """Tu es analyste de portefeuille. Les chiffres (cours, variations, \
+poids, performance, benchmark) sont DEJA calcules et te sont fournis. Tu ne les recalcules \
+pas et tu ne les contredis pas. Ton role : expliquer les mouvements > +/-1 %.
+
+Pour chaque mouvement fourni, recherche via web search les informations recentes (24-72h), \
+par ordre de priorite : resultats/guidance, actions d'analystes, news produit/business/regulation, \
+macro (Fed, CPI, emploi, taux), rotation sectorielle, sentiment, revalorisation.
+
+Regles : ne jamais inventer de catalyseur ; si rien de solide, ecrire "Aucun catalyseur clair \
+identifie". Separer les faits ("Selon [source]...") de l'interpretation ("Il est probable que..."). \
+Pas de conseil d'achat/vente. Francais uniquement. Chaque explication <= 4 phrases.
+
+Structure de l'email a produire :
+
+Objet : Performance quotidienne du portfolio - {date}
 
 1. Performance du portfolio
-[2–3 phrases. Performance totale pondérée du jour en %. Le marché large est-il en hausse ou en baisse ? Surperformance ou sous-performance ?]
+[2-3 phrases reprenant la performance ponderee et la comparaison au S&P 500 fournies.]
 
-2. Principaux mouvements
-Tableau de toutes les positions triées par variation absolue décroissante.
-| Ticker | Nom | Variation |
+2. Mouvements superieurs a 1 %
+Pour chaque ticker de la liste fournie :
+**[TICKER] - [Nom]** ([variation fournie])
+Catalyseur probable : [...]
+Classe comme : [Fondamentaux / Macro / Sentiment / Aucun catalyseur clair]
 
-3. Mouvements supérieurs à 1%
-Pour chaque position au-dessus de ±1% :
-
-**[TICKER] – [Nom]**
-Variation : [+/-X.XX%]
-Catalyseur probable : [explication concise, 4 phrases max. Séparer faits ("Selon [source]...") et interprétation ("Il est probable que...")]
-Classé comme : [Fondamentaux / Macro / Sentiment / Aucun catalyseur clair]
-
-4. Note de discipline
-[Une phrase. Rappeler de ne pas réagir émotionnellement sauf si la thèse d'investissement a fondamentalement changé.]
----
-
-## Règles de sortie
-- Français uniquement
-- Dense et court. Chaque explication de catalyseur ≤ 4 phrases
-- Pas de conseil d'achat/vente
-- Pas de récapitulatif macro générique sauf si ça explique directement une position
-- Si le mouvement est macro : "Mouvement macro généralisé, pas de catalyseur spécifique à la valeur."
-- Si les données d'un ticker sont indisponibles : le noter explicitement
-""".strip()
+3. Note de discipline
+[Une phrase : ne pas reagir emotionnellement sauf si la these a fondamentalement change.]
+"""
 
 
-def is_us_market_open_today() -> bool:
-    """Vérifie si c'est un jour de marché US (lundi–vendredi, hors jours fériés approximatifs)."""
-    today = date.today()
-    if today.weekday() >= 5:  # samedi=5, dimanche=6
-        return False
-    # Jours fériés US fixes les plus courants (approximation)
-    us_holidays = {
-        date(today.year, 1, 1),   # Nouvel An
-        date(today.year, 7, 4),   # Fête nationale
-        date(today.year, 12, 25), # Noël
-    }
-    return today not in us_holidays
-
-
-def build_prompt(today_str: str) -> str:
-    return (
-        f"Nous sommes le {today_str}. Les marchés US viennent de clôturer.\n\n"
-        "Applique le workflow portfolio-monitor complet sur le portefeuille défini dans le prompt système. "
-        "Utilise la recherche web pour récupérer les cours du jour et les actualités récentes. "
-        "Génère l'email complet en français, prêt à être envoyé."
-    )
-
-
-def call_claude(today_str: str) -> str:
-    """Appelle l'API Anthropic avec web search activé."""
+def call_claude(facts: str, today_str: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    system = SYSTEM_PROMPT.replace("{portfolio}", PORTFOLIO).replace("{date}", today_str)
-
-    log.info("Appel API Anthropic (claude-sonnet-4-20250514 + web search)...")
-
+    log.info("Appel API Anthropic (commentaire qualitatif + web search)...")
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
-        system=system,
+        system=SYSTEM_PROMPT.replace("{date}", today_str),
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": build_prompt(today_str)}],
+        messages=[{"role": "user", "content":
+                   f"Voici les chiffres deja calcules. Produis l'email.\n\n{facts}"}],
     )
-
-    # Extraire le texte de la réponse (peut contenir des blocs tool_use intermédiaires)
-    full_text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            full_text += block.text
-
-    if not full_text.strip():
-        raise ValueError("Réponse vide reçue de l'API Anthropic.")
-
-    return full_text.strip()
+    text = "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+    if not text:
+        raise ValueError("Reponse vide de l'API Anthropic.")
+    return text
 
 
 def send_email(subject: str, body: str) -> None:
-    """Envoie l'email via SMTP."""
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_SENDER
-    msg["To"]      = EMAIL_RECIPIENT
-
-    # Version texte brut
+    msg["Subject"], msg["From"], msg["To"] = subject, EMAIL_SENDER, EMAIL_RECIPIENT
     msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    log.info(f"Envoi email à {EMAIL_RECIPIENT}...")
+    log.info(f"Envoi email a {EMAIL_RECIPIENT}...")
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.ehlo(); server.starttls(); server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
-    log.info("Email envoyé.")
+    log.info("Email envoye.")
 
 
-def extract_subject(email_body: str, fallback_date: str) -> str:
-    """Extrait la ligne Objet du corps généré par Claude."""
-    for line in email_body.splitlines():
-        if "objet" in line.lower() or "subject" in line.lower():
-            # Prend ce qui suit le ":" sur la même ligne
+def extract_subject(body: str, fallback_date: str) -> str:
+    for line in body.splitlines():
+        if line.lower().startswith("objet") or line.lower().startswith("subject"):
             parts = line.split(":", 1)
             if len(parts) == 2 and parts[1].strip():
                 return parts[1].strip()
-    return f"Performance quotidienne du portfolio – {fallback_date}"
+    return f"Performance quotidienne du portfolio - {fallback_date}"
+
+
+def is_us_market_day() -> bool:
+    today = date.today()
+    if today.weekday() >= 5:
+        return False
+    holidays = {date(today.year, 1, 1), date(today.year, 7, 4), date(today.year, 12, 25)}
+    return today not in holidays
 
 
 def run_daily_job() -> None:
-    """Job principal : générer + envoyer le rapport portfolio."""
-    paris_tz  = ZoneInfo("Europe/Paris")
-    today     = datetime.now(paris_tz)
-    today_str = today.strftime("%d/%m/%Y")
-
-    log.info(f"=== Démarrage du job portfolio — {today_str} ===")
-
-    if not is_us_market_open_today():
-        log.info("Marché US fermé aujourd'hui. Job ignoré.")
+    today_str = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y")
+    log.info(f"=== Job portfolio - {today_str} ===")
+    if not is_us_market_day():
+        log.info("Marche US ferme. Job ignore.")
         return
-
     try:
-        email_body = call_claude(today_str)
-        subject    = extract_subject(email_body, today_str)
-        send_email(subject, email_body)
-        log.info("Job terminé avec succès.")
+        metrics = compute_metrics()
+        facts   = format_facts(metrics, today_str)
+        log.info("Chiffres calcules :\n" + facts)
+        body    = call_claude(facts, today_str)
+        send_email(extract_subject(body, today_str), body)
+        log.info("Job termine.")
     except Exception as e:
         log.error(f"Erreur durant le job : {e}", exc_info=True)
 
 
-# ── Planification ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Exécution immédiate si argument --now (pour test)
-    import sys
-    if "--now" in sys.argv:
-        log.info("Mode test : exécution immédiate.")
-        run_daily_job()
-        sys.exit(0)
-
-    # Planifié à 22h30 heure de Paris (30 min après la clôture US à 22h00)
-    schedule.every().day.at("22:30").do(run_daily_job)
-    log.info("Scheduler démarré. Job planifié à 22h30 (heure de Paris) chaque jour de marché.")
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    run_daily_job()
